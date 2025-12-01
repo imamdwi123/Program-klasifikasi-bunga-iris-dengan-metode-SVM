@@ -1,0 +1,202 @@
+// @ts-nocheck
+// =================== KONFIGURASI ===================
+var token        = "8450204466:AAGOPzyV9UfLsZjnEwS9sxkwMzPnITDJYUo";
+var telegramUrl  = "https://api.telegram.org/bot" + token;
+var webAppUrl    = "https://script.google.com/macros/s/AKfycbzEtY2nDWb7C4rm-v-TuQ2QNVUvOdIavMCk6ZVvp8nIXAzY65NtXmdHvCDY7XNKOtFLlQ/exec";
+var ssId         = "1HrZXYJAjzLdlPTbu3UBLhvwltWWzuq7Lj5FVVcGeRtk";
+
+// =================== FUNGSI BANTUAN ===================
+function getMe() {
+  var url = telegramUrl + "/getMe";
+  var response = UrlFetchApp.fetch(url);
+  Logger.log(response.getContentText());
+}
+
+function setWebhook() {
+  var url = telegramUrl + "/setWebhook?url=" + webAppUrl;
+  var response = UrlFetchApp.fetch(url);
+  Logger.log(response.getContentText());
+}
+
+function sendText(id, text) {
+  var url = telegramUrl + "/sendMessage";
+  var payload = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      chat_id: id,
+      text: text,
+      parse_mode: "Markdown"
+    })
+  };
+  UrlFetchApp.fetch(url, payload);
+}
+
+// =================== ENTRY POINT ===================
+function doGet(e) {
+  return HtmlService.createHtmlOutput("Hi there");
+}
+
+function doPost(e) {
+  var data = JSON.parse(e.postData.contents);
+  if (!data.message || !data.message.text) return;
+
+  var text  = data.message.text.trim();
+  var id    = data.message.chat.id;
+  var uname = data.message.from.username ? "@" + data.message.from.username : "";
+  var name  = (data.message.chat.first_name || "") + " " + (data.message.chat.last_name || "");
+
+  // ------------------- SAPAAN OTOMATIS -------------------
+  if (text !== "/start" && !text.startsWith("/close") && !text.startsWith("/progress") && !text.startsWith("/IB")) {
+    sendText(id, "👋 Hai " + (uname || name) + ", Tetap Semangat");
+  }
+
+  // ------------------- COMMAND START -------------------
+  if (text === "/start") {
+    sendText(id, "Selamat datang " + (uname || name) + "!\nKetik /close, /progress atau /IB untuk input laporan pekerjaan.");
+    return;
+  }
+
+  // =================== MAP FIELD DATA CLOSE/PROGRESS ===================
+  var map = {
+    "no inet": "noInet",
+    "no tiket": "noTiket",
+    "penyebab ggn": "penyebabGGN",
+    "perbaikan ggn": "perbaikanGGN",
+    "letak perbaikan": "letakPerbaikan",
+    "dc baru": "dcBaru",
+    "dc bekas": "dcBekas",
+    "protect": "protect",
+    "soc": "soc",
+    "adapter": "adapter",
+    "ont": "ont",
+    "stb": "stb",
+    "material lain": "materialLain",
+    "teknisi": "teknisi",
+    "nohp pelanggan": "noHpPelanggan"
+  };
+
+  // =================== SIMPAN DATA CLOSE / PROGRESS ===================
+  function simpanData(status) {
+    var lines = text.split("\n").slice(1);
+    var dataObj = {};
+
+    lines.forEach(function(line) {
+      var parts = line.split(":");
+      if (parts.length >= 2) {
+        var key = parts[0].trim().toLowerCase();
+        var val = parts.slice(1).join(":").trim();
+        if (map[key]) {
+          dataObj[map[key]] = val;
+        }
+      }
+    });
+
+    if (!dataObj.noInet) {
+      sendText(id, "❌ Format tidak valid.\nPastikan format seperti:\n\n" + status.toLowerCase() + "\nNo Inet: ...\nNo Tiket: ...\n...");
+      return;
+    }
+
+    dataObj.status = status;
+
+    var ss = SpreadsheetApp.openById(ssId);
+    var sheet = ss.getSheetByName("Telkom Akses");
+    if (!sheet) {
+      sheet = ss.insertSheet("Telkom Akses");
+    }
+
+    sheet.appendRow([
+      new Date(), id, (uname || name),
+      dataObj.noInet, dataObj.noTiket, dataObj.penyebabGGN, dataObj.perbaikanGGN, dataObj.letakPerbaikan,
+      dataObj.dcBaru, dataObj.dcBekas, dataObj.protect, dataObj.soc, dataObj.adapter, dataObj.ont, dataObj.stb,
+      dataObj.materialLain, dataObj.teknisi, dataObj.noHpPelanggan, dataObj.status
+    ]);
+
+    sendText(id, "✅ Data berhasil disimpan di sheet *Telkom Akses* dengan status *" + status + "*!");
+  }
+
+  // ------------------- COMMAND CLOSE -------------------
+  if (text.startsWith("/close")) {
+    simpanData("Close");
+    return;
+  }
+
+  // ------------------- COMMAND PROGRESS -------------------
+  if (text.startsWith("/progress")) {
+    simpanData("Progress");
+    return;
+  }
+
+  // =================== MAP FIELD DATA IB ===================
+  var mapIB = {
+    "tim": "tim",
+    "type order": "typeOrder",
+    "cust_id": "custId",
+    "wo_id": "woId",
+    "nama_cust": "namaCust",
+    "alamat_cust": "alamatCust",
+    "cluster": "cluster",
+    "sto": "sto",
+    "vendor": "vendor",
+    "sn_ont": "snOnt",
+    "mac_ont": "macOnt",
+    "mac_stb": "macStb",
+    "panjang_dc": "panjangDc",
+    "barcode_dc": "barcodeDc",
+    "redaman_fat": "redamanFat",
+    "label_fat": "labelFat",
+    "kap_fat": "kapFat",
+    "port_fat": "portFat",
+    "sisa_port_fat": "sisaPortFat",
+    "tagging_fat": "taggingFat",
+    "tagging_pelaggan": "taggingPelanggan",
+    "ket": "ket"
+  };
+
+  // =================== SIMPAN DATA IB ===================
+  function simpanDataIB() {
+    var lines = text.split("\n").slice(1);
+    var dataObj = {};
+
+    lines.forEach(function(line) {
+      var parts = line.split(":");
+      if (parts.length >= 2) {
+        var key = parts[0].trim().toLowerCase();
+        var val = parts.slice(1).join(":").trim();
+        if (mapIB[key]) {
+          dataObj[mapIB[key]] = val;
+        }
+      }
+    });
+
+    if (!dataObj.tim) {
+      sendText(id, "❌ Format tidak valid.\nPastikan format seperti:\n\n/IB\nTIM : ...\nTYPE ORDER : ...\n...");
+      return;
+    }
+
+    var ss = SpreadsheetApp.openById(ssId);
+    var sheet = ss.getSheetByName("My Republic");
+    if (!sheet) {
+      sheet = ss.insertSheet("My Republic");
+    }
+
+    sheet.appendRow([
+      new Date(), id, (uname || name),
+      dataObj.tim, dataObj.typeOrder, dataObj.custId, dataObj.woId, dataObj.namaCust, dataObj.alamatCust,
+      dataObj.cluster, dataObj.sto, dataObj.vendor, dataObj.snOnt, dataObj.macOnt, dataObj.macStb,
+      dataObj.panjangDc, dataObj.barcodeDc, dataObj.redamanFat, dataObj.labelFat, dataObj.kapFat,
+      dataObj.portFat, dataObj.sisaPortFat, dataObj.taggingFat, dataObj.taggingPelanggan, dataObj.ket
+    ]);
+
+    sendText(id, "✅ Data IB berhasil direkap di sheet *My Republic*!");
+  }
+
+  // ------------------- COMMAND IB -------------------
+  if (text.startsWith("/IB")) {
+    simpanDataIB();
+    return;
+  }
+
+  // ------------------- DEFAULT -------------------
+  sendText(id, "Ketik /close, /progress, atau /IB diikuti data laporan untuk menyimpan.");
+}
