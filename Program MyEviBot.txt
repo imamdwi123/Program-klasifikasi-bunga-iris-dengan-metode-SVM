@@ -1,0 +1,559 @@
+// @ts-nocheck
+// Telegram IB Bot - with automatic image resize and in-cell embedding
+// Pastikan: aktifkan Advanced Drive Service (Resources -> Advanced Google services -> Drive API ON)
+
+// =================== KONFIGURASI ===================
+var token = "7832286609:AAEY_txp4XIY5IokbmY5VIc2AklQkcIJC_w";
+var telegramUrl = "https://api.telegram.org/bot" + token;
+var webAppUrl = "https://script.google.com/macros/s/AKfycbzPmxLPfrqwJXKm_SxNiWFTXoQc4NX9O5ht_HEQHA97SrgHpoaACZhmyan6B5wijv8/exec";
+var ssId = "1HrZXYJAjzLdlPTbu3UBLhvwltWWzuq7Lj5FVVcGeRtk";
+
+// MAX rules
+var MAX_PIXEL_COUNT = 1000000; // jangan sampai > 1.000.000 pixel (width * height)
+var MAX_BLOB_BYTES = 2 * 1024 * 1024; // target <= 2MB untuk aman saat insert
+
+// =================== PENGATURAN TAMPILAN GAMBAR DI SHEET ===================
+// Perhatian: kolom di-shift +1 karena ditambahkan kolom "Info MyRepublic (col S)"
+var IMAGE_SETTINGS = {
+  "fotoRumah":   { col: 8,  width: 220, height: 160 }, // Foto Rumah (sekarang kolom 8)
+  "posisiPerangkat": { col: 9,  width: 220, height: 160 }, // Posisi Perangkat (kolom 9)
+  "macSnOnt":    { col: 10, width: 220, height: 160 },
+  "macSnStb":    { col: 11, width: 220, height: 160 },
+  "speedtest":   { col: 12, width: 300, height: 160 },
+  "ssDigSignal": { col: 13, width: 220, height: 160 },
+  "kodeFat":     { col: 14, width: 220, height: 160 },
+  "labelingFat": { col: 15, width: 220, height: 160 }
+};
+
+// =================== UTIL / HELPERS ===================
+function sendText(chatId, text, parse_mode) {
+  var url = telegramUrl + "/sendMessage";
+  var payload = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      chat_id: chatId,
+      text: text,
+      parse_mode: parse_mode || "Markdown"
+    })
+  };
+  UrlFetchApp.fetch(url, payload);
+}
+
+function getFileLinkFromTelegram(fileId) {
+  var resp = UrlFetchApp.fetch(telegramUrl + "/getFile?file_id=" + fileId);
+  var j = JSON.parse(resp.getContentText());
+  if (!j.ok) return null;
+  var filePath = j.result.file_path;
+  var fileUrl = "https://api.telegram.org/file/bot" + token + "/" + filePath;
+  return fileUrl;
+}
+
+/**
+ * Process Telegram photo:
+ * - fetch blob from Telegram file URL
+ * - attempt to resize so pixel count <= MAX_PIXEL_COUNT and blob size <= MAX_BLOB_BYTES
+ * - save resized blob to Drive (backup) and return DRIVE_ID string
+ *
+ * Returns: "DRIVE_ID:<fileId>" (string) to be stored in draft cell
+ */
+function processTelegramPhoto(fileUrl, name) {
+  try {
+    var resp = UrlFetchApp.fetch(fileUrl);
+    var blob = resp.getBlob();
+    // Attempt resizing
+    var resizedBlob = tryResizeBlob(blob, MAX_PIXEL_COUNT, MAX_BLOB_BYTES);
+    // Save to Drive (final stored copy)
+    var finalName = name || ("IB_" + new Date().getTime());
+    var file = DriveApp.createFile(resizedBlob).setName(finalName);
+    // optional: make viewable if you want (not necessary for in-cell embedding)
+    // file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return "DRIVE_ID:" + file.getId();
+  } catch (e) {
+    // fallback: if anything gagal, return original URL so it won't block flow
+    return fileUrl;
+  }
+}
+
+/**
+ * Try to resize a blob using Drive thumbnail trick (Drive.Files.get(...).thumbnailLink)
+ * This requires Advanced Drive Service enabled.
+ *
+ * Strategy:
+ *  - create temp file in Drive (file1)
+ *  - get thumbnailLink from Drive.Files.get(fileId)
+ *  - request that thumbnail with decreasing widths (1000,800,600,400,...)
+ *  - pick first result that meets byte-size constraint
+ *
+ * If Drive thumbnail not available or resizing fails, return original blob.
+ */
+function tryResizeBlob(blob, maxPixels, maxBytes) {
+  // Quick pass: if current blob already small enough, return it
+  try {
+    if (blob.getBytes().length <= maxBytes) return blob;
+  } catch (e) {
+    // ignore
+  }
+
+  var tempFile;
+  try {
+    tempFile = DriveApp.createFile(blob);
+    var fileId = tempFile.getId();
+    // get thumbnailLink via Advanced Drive
+    var fileMeta = Drive.Files.get(fileId);
+    var thumbnailLink = fileMeta && fileMeta.thumbnailLink ? fileMeta.thumbnailLink : null;
+    if (!thumbnailLink) {
+      // clean up and fallback
+      return blob;
+    }
+
+    // candidate widths (px) — from large -> small; tune as needed
+    var candidates = [1000, 800, 600, 500, 400, 300, 250, 200];
+    for (var i = 0; i < candidates.length; i++) {
+      var w = candidates[i];
+      var link;
+      if (thumbnailLink.match(/=s\d+/)) {
+        link = thumbnailLink.replace(/=s\d+/, "=s" + w);
+      } else if (thumbnailLink.indexOf("?") !== -1) {
+        // append fallback
+        link = thumbnailLink + "&sz=" + w;
+      } else {
+        link = thumbnailLink + "=s" + w;
+      }
+
+      try {
+        var r = UrlFetchApp.fetch(link, {muteHttpExceptions: true, followRedirects:true});
+        if (r.getResponseCode && r.getResponseCode() !== 200) continue;
+        var b = r.getBlob();
+        // Check byte size
+        if (b.getBytes().length <= maxBytes) {
+          // Good enough — remove tempFile and return this blob
+          tempFile.setTrashed(true);
+          return b;
+        } else {
+          // still too big, try next smaller candidate
+          continue;
+        }
+      } catch (e) {
+        // try next
+        continue;
+      }
+    }
+
+    // If none of candidates satisfy size, as last resort: return the smallest candidate we could fetch (if any)
+    var last = candidates[candidates.length - 1];
+    var finalLink = thumbnailLink.match(/=s\d+/) ? thumbnailLink.replace(/=s\d+/, "=s" + last) : thumbnailLink + "=s" + last;
+    try {
+      var rr = UrlFetchApp.fetch(finalLink);
+      var bb = rr.getBlob();
+      tempFile.setTrashed(true);
+      return bb;
+    } catch (e) {
+      tempFile.setTrashed(true);
+      return blob;
+    }
+
+  } catch (e) {
+    try { if (tempFile) tempFile.setTrashed(true); } catch (er){}
+    return blob;
+  }
+}
+
+// =================== DRAFT (STATE) SHEET HELPERS ===================
+function getDraftSheet() {
+  var ss = SpreadsheetApp.openById(ssId);
+  var sh = ss.getSheetByName("IB_Drafts");
+  if (!sh) {
+    sh = ss.insertSheet("IB_Drafts");
+    sh.appendRow([
+      "chatId","uname","name","stepIndex",
+      "custId","fotoRumah","posisiPerangkat","macSnOnt","macSnStb",
+      "speedtest","ssDigSignal","kodeFat","labelingFat",
+      "evidenRow","createdAt","updatedAt"
+    ]);
+  }
+  return sh;
+}
+
+function findDraftRow(chatId) {
+  var sh = getDraftSheet();
+  var data = sh.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(chatId)) return i + 1;
+  }
+  return -1;
+}
+
+function createOrResetDraft(chatId, uname, name) {
+  var sh = getDraftSheet();
+  var rowIndex = findDraftRow(chatId);
+  var now = new Date();
+  if (rowIndex === -1) {
+    sh.appendRow([chatId, uname || "", name || "", 0, "", "", "", "", "", "", "", "", "", "", now, now]);
+  } else {
+    sh.getRange(rowIndex,1,1,16).setValues([[chatId, uname || "", name || "", 0, "", "", "", "", "", "", "", "", "", "", now, now]]);
+  }
+}
+
+function updateDraftField(chatId, colName, value) {
+  var colMap = {
+    "stepIndex":4, "custId":5, "fotoRumah":6, "posisiPerangkat":7, "macSnOnt":8, "macSnStb":9,
+    "speedtest":10, "ssDigSignal":11, "kodeFat":12, "labelingFat":13, "evidenRow":14, "updatedAt":16
+  };
+  var sh = getDraftSheet();
+  var rowIndex = findDraftRow(chatId);
+  if (rowIndex === -1) return false;
+  if (!(colName in colMap)) return false;
+  sh.getRange(rowIndex, colMap[colName]).setValue(value);
+  sh.getRange(rowIndex, colMap["updatedAt"]).setValue(new Date());
+  return true;
+}
+
+function getDraftObject(chatId) {
+  var sh = getDraftSheet();
+  var rowIndex = findDraftRow(chatId);
+  if (rowIndex === -1) return null;
+  var vals = sh.getRange(rowIndex,1,1,16).getValues()[0];
+  return {
+    rowIndex: rowIndex,
+    chatId: vals[0],
+    uname: vals[1],
+    name: vals[2],
+    stepIndex: Number(vals[3]) || 0,
+    custId: vals[4],
+    fotoRumah: vals[5],
+    posisiPerangkat: vals[6],
+    macSnOnt: vals[7],
+    macSnStb: vals[8],
+    speedtest: vals[9],
+    ssDigSignal: vals[10],
+    kodeFat: vals[11],
+    labelingFat: vals[12],
+    evidenRow: vals[13] || null,
+    createdAt: vals[14],
+    updatedAt: vals[15]
+  };
+}
+
+function deleteDraft(chatId) {
+  var sh = getDraftSheet();
+  var rowIndex = findDraftRow(chatId);
+  if (rowIndex === -1) return false;
+  sh.deleteRow(rowIndex);
+  return true;
+}
+
+// =================== SEARCH CUSTOMER DI SHEET My Republic ===================
+// sekarang juga mengembalikan nilai kolom S (index 19) sebagai property colS
+function findCustomerInMyRepublic(custId) {
+  if (!custId) return null;
+  var ss = SpreadsheetApp.openById(ssId);
+  var sh = ss.getSheetByName("My Republic");
+  if (!sh) return null;
+  var lastRow = sh.getLastRow();
+  if (lastRow < 2) return null;
+  var range = sh.getRange(2, 6, Math.max(1, lastRow - 1), 4); // F,G,H,I
+  var data = range.getValues();
+  for (var i = 0; i < data.length; i++) {
+    var f = String(data[i][0]).trim();
+    if (f === String(custId).trim()) {
+      var name = data[i][2] || ""; // H
+      var address = data[i][3] || ""; // I
+      var rowNumber = i + 2;
+      var colSVal = "";
+      try {
+        colSVal = sh.getRange(rowNumber, 19).getValue(); // kolom S = index 19
+      } catch (e) {
+        colSVal = "";
+      }
+      return { row: rowNumber, custId: f, name: String(name).trim(), address: String(address).trim(), colS: String(colSVal).trim() };
+    }
+  }
+  return null;
+}
+
+// =================== NORMALISASI LINK DRIVE ===================
+function normalizeToUcDriveLink(url) {
+  if (!url || typeof url !== "string") return url;
+  if (url.indexOf("drive.google.com/uc?export=view&id=") !== -1) return url;
+  var m = url.match(/\/d\/([a-zA-Z0-9_-]{10,})/);
+  if (m && m[1]) {
+    return "https://drive.google.com/uc?export=view&id=" + m[1];
+  }
+  m = url.match(/[?&]id=([a-zA-Z0-9_-]{10,})/);
+  if (m && m[1]) return "https://drive.google.com/uc?export=view&id=" + m[1];
+  return url;
+}
+
+// =================== SIMPAN / UPDATE KE Eviden Republic ===================
+// Jika existingRow disediakan -> update row tersebut; jika tidak -> append baru.
+// Ditambahkan parameter prefillColS untuk memasukkan nilai dari kolom S My Republic
+function saveFinalToMyRepublic(draftObj, prefillName, prefillAddress, prefillColS, existingRow) {
+  var ss = SpreadsheetApp.openById(ssId);
+  var sh = ss.getSheetByName("Eviden Republic");
+  if (!sh) {
+    sh = ss.insertSheet("Eviden Republic");
+    sh.appendRow([
+      "Timestamp",
+      "Chat_ID",
+      "Username",
+      "Customer_ID",
+      "Nama Customer",
+      "Alamat Customer",
+      "Info MyRepublic (col S)",    // <-- new column inserted here (kolom ke-7)
+      "Foto Rumah",
+      "Posisi Perangkat",
+      "Mac & SN ONT",
+      "Mac & SN STB",
+      "Speedtest / Test Signal di OPM",
+      "SS DIG Signal Telegram",
+      "Kode FAT",
+      "Labeling FAT"
+    ]);
+  }
+
+  var baseRowValues = [
+    new Date(),
+    draftObj.chatId || "",
+    draftObj.uname || draftObj.name || "",
+    draftObj.custId || "",
+    prefillName || "",
+    prefillAddress || "",
+    prefillColS || "", // isi dari kolom S My Republic
+    "", "", "", "", "", "", "", ""
+  ];
+
+  var rowPos;
+  if (existingRow) {
+    rowPos = existingRow;
+    try {
+      sh.getRange(rowPos,1,1,15).setValues([baseRowValues]); // now 15 columns
+    } catch (e) {
+      sh.appendRow(baseRowValues);
+      rowPos = sh.getLastRow();
+    }
+  } else {
+    sh.appendRow(baseRowValues);
+    rowPos = sh.getLastRow();
+  }
+
+  var maxRowHeight = 21;
+
+  function putImageIfDriveKey(key, val) {
+    if (!val) return;
+    var s = String(val).trim();
+
+    // If it's DRIVE_ID:<id> -> embed the image into the cell using newCellImage(dataURL)
+    if (s.indexOf("DRIVE_ID:") === 0) {
+      var fileId = s.split("DRIVE_ID:")[1];
+      try {
+        var file = DriveApp.getFileById(fileId);
+        var blob = file.getBlob();
+        var bytes = blob.getBytes();
+        var mime = blob.getContentType() || "image/png";
+        var dataUrl = "data:" + mime + ";base64," + Utilities.base64Encode(bytes);
+        var cellImg = SpreadsheetApp.newCellImage()
+                      .setSourceUrl(dataUrl)
+                      .setAltTextTitle(file.getName())
+                      .build();
+        var cfg = IMAGE_SETTINGS[key] || { col: 8, width: 220, height: 160 };
+        var range = sh.getRange(rowPos, cfg.col);
+        // set the cell image
+        range.setValue(cellImg);
+        // adjust visual size (column width & row height)
+        try { sh.setColumnWidth(cfg.col, cfg.width); } catch (e) {}
+        if (cfg.height > maxRowHeight) maxRowHeight = cfg.height;
+      } catch (e) {
+        // fallback: write file URL as text
+        sh.getRange(rowPos, IMAGE_SETTINGS[key] ? IMAGE_SETTINGS[key].col : 8).setValue("DRIVE FILE ID:" + fileId);
+      }
+      return;
+    }
+
+    // If not DRIVE_ID but a normal http(s) link -> fallback to write URL text
+    if (s.indexOf("http://") === 0 || s.indexOf("https://") === 0) {
+      var colIndexFallback = (function(mapKey) {
+        var m = {
+          "fotoRumah":8,"posisiPerangkat":9,"macSnOnt":10,"macSnStb":11,
+          "speedtest":12,"ssDigSignal":13,"kodeFat":14,"labelingFat":15
+        };
+        return m[mapKey];
+      })(key);
+      if (colIndexFallback) sh.getRange(rowPos, colIndexFallback).setValue(s);
+      return;
+    }
+
+    // Otherwise set text as-is
+    var colIndex = (function(mapKey) {
+      var m = {
+        "fotoRumah":8,"posisiPerangkat":9,"macSnOnt":10,"macSnStb":11,
+        "speedtest":12,"ssDigSignal":13,"kodeFat":14,"labelingFat":15
+      };
+      return m[mapKey];
+    })(key);
+    if (colIndex) sh.getRange(rowPos, colIndex).setValue(s);
+  }
+
+  putImageIfDriveKey("fotoRumah", draftObj.fotoRumah);
+  putImageIfDriveKey("posisiPerangkat", draftObj.posisiPerangkat);
+  putImageIfDriveKey("macSnOnt", draftObj.macSnOnt);
+  putImageIfDriveKey("macSnStb", draftObj.macSnStb);
+  putImageIfDriveKey("speedtest", draftObj.speedtest);
+  putImageIfDriveKey("ssDigSignal", draftObj.ssDigSignal);
+  putImageIfDriveKey("kodeFat", draftObj.kodeFat);
+  putImageIfDriveKey("labelingFat", draftObj.labelingFat);
+
+  try { sh.setRowHeight(rowPos, maxRowHeight); } catch (e) {}
+
+  return rowPos;
+}
+
+// =================== FLOW / STEP DEFINISI ===================
+var STEPS = [
+  { key: "custId", prompt: "📥 *Customer ID*:\nSilakan kirim *Customer ID* (ketik ID sebagai teks)." },
+  { key: "fotoRumah", prompt: "📷 *Foto Rumah*:\nKirim foto rumah (kirim sebagai foto). Jika ingin mengirim teks, kirim keterangan." },
+  { key: "posisiPerangkat", prompt: "📷 *Posisi Perangkat*:\nKirim foto posisi perangkat atau ketik posisinya." },
+  { key: "macSnOnt", prompt: "🔖 *Mac & SN ONT*:\nKirim foto atau ketik Mac & SN ONT." },
+  { key: "macSnStb", prompt: "🔖 *Mac & SN STB*:\nKirim foto atau ketik Mac & SN STB." },
+  { key: "speedtest", prompt: "📶 *Speedtest / test signal di OPM*:\nKirim screenshot atau teks hasil speedtest." },
+  { key: "ssDigSignal", prompt: "📲 *SS DIG Signal Telegram*:\nKirim screenshot signal Telegram (foto) atau teks." },
+  { key: "kodeFat", prompt: "🔢 *Kode FAT*:\nKetik kode FAT (atau kirim foto jika ada)." },
+  { key: "labelingFat", prompt: "🏷️ *Labeling FAT*:\nKetik labeling FAT (atau kirim foto jika ada)." }
+];
+
+// =================== ENTRY POINTS ===================
+function doGet(e) {
+  return HtmlService.createHtmlOutput("Hi there - Telegram IB Bot is running.");
+}
+
+function doPost(e) {
+  if (!e.postData || !e.postData.contents) return;
+  var data = JSON.parse(e.postData.contents);
+  if (!data.message) return;
+  var msg = data.message;
+  var chatId = msg.chat.id;
+  var text = (msg.text || "").trim();
+  var photos = msg.photo || null;
+  var uname = msg.from && msg.from.username ? "@" + msg.from.username : "";
+  var name = ((msg.chat.first_name || "") + " " + (msg.chat.last_name || "")).trim();
+
+  // Command: /IB (start) atau /cancel
+  if (text && text.split(" ")[0] === "/IB") {
+    createOrResetDraft(chatId, uname, name);
+    sendText(chatId, STEPS[0].prompt);
+    return;
+  }
+  if (text && text.split(" ")[0] === "/cancel") {
+    var ok = deleteDraft(chatId);
+    if (ok) sendText(chatId, "✅ Draft IB dibatalkan.");
+    else sendText(chatId, "Tidak ada draft aktif. Ketik /IB untuk memulai.");
+    return;
+  }
+
+  // Proses flow
+  var draft = getDraftObject(chatId);
+  if (!draft) {
+    sendText(chatId, "Tidak ada proses IB aktif.\nKetik /IB untuk memulai input IB.");
+    return;
+  }
+
+  var stepIndex = draft.stepIndex || 0;
+  var currentStep = STEPS[stepIndex];
+  if (!currentStep) {
+    sendText(chatId, "Terjadi kesalahan langkah. Mohon ketik /IB untuk memulai ulang.");
+    deleteDraft(chatId);
+    return;
+  }
+
+  // Ambil nilai dari foto atau teks
+  var valueToStore = "";
+  if (photos && photos.length > 0) {
+    var photoObj = photos[photos.length - 1];
+    var fileId = photoObj.file_id;
+    var fileUrl = getFileLinkFromTelegram(fileId);
+    var fileName = "IB_" + chatId + "_" + currentStep.key + "_" + new Date().getTime();
+    var driveIdOrUrl = processTelegramPhoto(fileUrl, fileName); // returns DRIVE_ID:<id> or fallback url
+    valueToStore = driveIdOrUrl;
+  } else if (text) {
+    valueToStore = text;
+  } else {
+    sendText(chatId, "Mohon kirim foto atau teks sesuai instruksi.\n" + currentStep.prompt);
+    return;
+  }
+
+  // Jika langkah pertama (custId) -> cek di sheet My Republic, kalau ada, tambahkan 1x baris di Eviden Republic
+  if (currentStep.key === "custId") {
+    updateDraftField(chatId, "custId", valueToStore);
+    var found = findCustomerInMyRepublic(valueToStore);
+    if (found) {
+      var currentDraft = getDraftObject(chatId);
+      var existing = currentDraft.evidenRow;
+      if (!existing) {
+        // now pass colS (found.colS) into saveFinalToMyRepublic so it fills "Info MyRepublic (col S)"
+        var rowPos = saveFinalToMyRepublic(currentDraft, found.name, found.address, found.colS, null);
+        updateDraftField(chatId, "evidenRow", rowPos);
+      }
+      sendText(chatId, "✅ *Customer ID ditemukan* di sheet My Republic.\nNama: " + (found.name || "-") + "\nAlamat: " + (found.address || "-") + (found.colS ? ("\nFAT): " + found.colS) : ""));
+      updateDraftField(chatId, "stepIndex", stepIndex + 1);
+      sendText(chatId, STEPS[stepIndex + 1].prompt);
+    } else {
+      sendText(chatId, "⚠️ *Customer ID tidak ditemukan* di sheet My Republic. Proses dibatalkan.\nSilakan periksa kembali Customer ID atau hubungi admin.");
+      deleteDraft(chatId);
+    }
+    return;
+  }
+
+  // mapping step -> kolom draft
+  var stepKeyToCol = {
+    "fotoRumah": "fotoRumah",
+    "posisiPerangkat": "posisiPerangkat",
+    "macSnOnt": "macSnOnt",
+    "macSnStb": "macSnStb",
+    "speedtest": "speedtest",
+    "ssDigSignal": "ssDigSignal",
+    "kodeFat": "kodeFat",
+    "labelingFat": "labelingFat"
+  };
+
+  if (stepKeyToCol[currentStep.key]) {
+    updateDraftField(chatId, stepKeyToCol[currentStep.key], valueToStore);
+  } else {
+    sendText(chatId, "Langkah tidak dikenali. Ketik /IB untuk memulai ulang.");
+    deleteDraft(chatId);
+    return;
+  }
+
+  // Next step / selesai
+  var nextIndex = stepIndex + 1;
+  if (nextIndex < STEPS.length) {
+    updateDraftField(chatId, "stepIndex", nextIndex);
+    sendText(chatId, "✅ Disimpan.\n\n" + STEPS[nextIndex].prompt);
+    return;
+  } else {
+    // selesai -> update row Eviden Republic yang sudah dibuat pada langkah custId (jangan append lagi)
+    var finalDraft = getDraftObject(chatId);
+    var pre = findCustomerInMyRepublic(finalDraft.custId);
+    var preName = pre ? pre.name : "";
+    var preAddr = pre ? pre.address : "";
+    var preS = pre ? pre.colS : "";
+    var existingRow = finalDraft.evidenRow || null;
+    saveFinalToMyRepublic(finalDraft, preName, preAddr, preS, existingRow);
+    deleteDraft(chatId);
+
+    sendText(chatId, "✅ Semua data berhasil direkap ke sheet *Eviden Republic*. Terima kasih!");
+    return;
+  }
+}
+
+// =================== FUNGSI BANTUAN LAIN ===================
+function getMe() {
+  var url = telegramUrl + "/getMe";
+  var response = UrlFetchApp.fetch(url);
+  Logger.log(response.getContentText());
+}
+
+function setWebhook() {
+  var url = telegramUrl + "/setWebhook?url=" + webAppUrl;
+  var response = UrlFetchApp.fetch(url);
+  Logger.log(response.getContentText());
+}
